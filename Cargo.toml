@@ -1,0 +1,18 @@
+[package]
+name = "libopus"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+av-format = "0.7.1"
+libc = "0.2.175"
+av-data = "0.4.1"
+matroska = { version = "0.1.0", path = "./matroska", package = "matroska" }
+av-codec = "0.3.1"
+av-bitstream = "0.2.1"
+
+
+[build-dependencies]
+bindgen = { version = "0.72.1" }
+cmake =  { version = "0.1.4" }
+
