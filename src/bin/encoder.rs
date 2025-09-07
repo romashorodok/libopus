@@ -19,6 +19,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::slice;
 use std::sync::Arc;
+use std::time::Duration;
 
 use libopus::*;
 use matroska::muxer::{self, MkvMuxer};
@@ -99,6 +100,98 @@ pub fn put_i32b(buf: &mut [u8], n: i32) {
 //     })
 //   }
 // }
+use std::io::{Seek, SeekFrom};
+
+fn read_wav_header(
+  file: &mut File,
+) -> Result<(u32, u16, u32, u32), Box<dyn std::error::Error>> {
+  let mut header = [0u8; 12];
+  file.read_exact(&mut header)?;
+
+  // Check RIFF signature
+  if &header[0..4] != b"RIFF" {
+    return Err("Not a valid RIFF file".into());
+  }
+
+  // Check WAVE signature
+  if &header[8..12] != b"WAVE" {
+    return Err("Not a valid WAVE file".into());
+  }
+
+  let mut channels = 0u16;
+  let mut sample_rate = 0u32;
+  let mut bits_per_sample = 0u16;
+  let mut data_size = 0u32;
+  let mut fmt_found = false;
+  let mut data_found = false;
+
+  // Read chunks until we find both fmt and data chunks
+  while !fmt_found || !data_found {
+    let mut chunk_header = [0u8; 8];
+    if file.read_exact(&mut chunk_header).is_err() {
+      return Err("Unexpected end of file while reading chunks".into());
+    }
+
+    let chunk_id = &chunk_header[0..4];
+    let chunk_size = u32::from_le_bytes([
+      chunk_header[4],
+      chunk_header[5],
+      chunk_header[6],
+      chunk_header[7],
+    ]);
+
+    match chunk_id {
+      b"fmt " => {
+        if chunk_size < 16 {
+          return Err("Invalid fmt chunk size".into());
+        }
+
+        let mut fmt_data = vec![0u8; chunk_size as usize];
+        file.read_exact(&mut fmt_data)?;
+
+        // Parse format data
+        let audio_format = u16::from_le_bytes([fmt_data[0], fmt_data[1]]);
+        if audio_format != 1 {
+          return Err("Only PCM format is supported".into());
+        }
+
+        channels = u16::from_le_bytes([fmt_data[2], fmt_data[3]]);
+        sample_rate = u32::from_le_bytes([
+          fmt_data[4],
+          fmt_data[5],
+          fmt_data[6],
+          fmt_data[7],
+        ]);
+        bits_per_sample = u16::from_le_bytes([fmt_data[14], fmt_data[15]]);
+
+        fmt_found = true;
+      }
+      b"data" => {
+        data_size = chunk_size;
+        data_found = true;
+        // Don't read the data, just note where it starts
+      }
+      _ => {
+        // Skip unknown chunks
+        file.seek(SeekFrom::Current(chunk_size as i64))?;
+      }
+    }
+  }
+
+  if !fmt_found {
+    return Err("fmt chunk not found".into());
+  }
+  if !data_found {
+    return Err("data chunk not found".into());
+  }
+
+  println!(
+    "WAV file info: {} channels, {} Hz, {} bits, {} bytes of audio data",
+    channels, sample_rate, bits_per_sample, data_size
+  );
+
+  Ok((sample_rate, channels, bits_per_sample as u32, data_size))
+}
 
 fn main() {
   // let enc_opt = EncodingOpts {
@@ -112,10 +205,23 @@ fn main() {
 
   let mut in_f = File::open(PathBuf::from("test.wav")).unwrap();
   // let mut out_f = File::create(enc_opt.output).unwrap();
+  let (wav_sample_rate, wav_channels, wav_bits_per_sample, audio_data_size) =
+    read_wav_header(&mut in_f).unwrap();
+
+  if wav_sample_rate != 48000 {
+    panic!("Expected 48kHz sample rate, got {}", wav_sample_rate);
+  }
+  if wav_channels != 1 {
+    panic!("Expected mono audio, got {} channels", wav_channels);
+  }
+  if wav_bits_per_sample != 16 {
+    panic!("Expected 16-bit audio, got {} bits", wav_bits_per_sample);
+  }
 
   use av_codec::encoder::{Descriptor, Encoder};
 
-  let channels: usize = 1;
+  let channels: usize = wav_channels as usize;
+
   let mut enc = OPUS_DESCR.create();
   enc
     .set_option("channels", av_data::value::Value::U64(channels as u64))
@@ -131,22 +237,31 @@ fn main() {
 
   let mkv_timebase = av_data::rational::Rational64::new(1, 1000);
 
-  let sample_rate = 48000;
+  let sample_rate = wav_sample_rate as i64;
   let sample_timebase = av_data::rational::Rational64::new(1, sample_rate);
+
+  let mut abs_pts_samples: i64 = 0; // PTS in samples
+  let mut cluster_time_ms: i64 = 0; // cluster base time in milliseconds
+  let mut cluster_started = false;
+
+  let bytes_per_sample = (wav_bits_per_sample / 8) as u32;
+  let total_samples =
+    audio_data_size / (bytes_per_sample * wav_channels as u32);
+  let duration_seconds = total_samples as f64 / wav_sample_rate as f64;
 
   let stream_info = av_format::stream::Stream {
     id: 0,
     index: 0,
     params: codec_params.clone(),
     start: None,
-    duration: None,
+    duration: Some(duration_seconds as u64),
     timebase: sample_timebase,
     user_private: None,
   };
 
   mux
     .set_global_info(av_format::common::GlobalInfo {
-      duration: None,
+      duration: Some(duration_seconds as u64),
       timebase: Some(sample_timebase),
       streams: vec![stream_info],
     })
@@ -155,191 +270,209 @@ fn main() {
   mux.configure().unwrap();
   mux.write_header().unwrap();
 
-  let mut abs_pts_samples: i64 = 0; // PTS in samples
-  let mut cluster_time_ms: i64 = 0; // cluster base time in milliseconds
-  let mut cluster_started = false;
+  println!(
+    "Total samples: {}, Duration: {:.2} seconds",
+    total_samples, duration_seconds
+  );
+
+  // let frame_size = 960;
+  // let bytes_per_frame = frame_size * channels * bytes_per_sample as usize;
+  // let mut buf = vec![0u8; bytes_per_frame];
+  // let mut bytes_read_total = 0u32;
 
   // read raw PCM (dummy: replace with proper WAV reader)
+  // let frame_size = 960;
+  // let mut buf = vec![0u8; frame_size * channels as usize * 2];
   let frame_size = 960;
-  let mut buf = vec![0u8; frame_size * channels as usize * 2];
-  while let Ok(_) = in_f.read_exact(&mut buf) {
-    // let samples: &[i16] =
-    //   unsafe { slice::from_raw_parts(buf.as_ptr() as *const i16, frame_size) };
+  let bytes_per_frame = frame_size * channels * bytes_per_sample as usize;
+  let mut buf = vec![0u8; bytes_per_frame];
+  let mut bytes_read_total = 0u32;
 
-    let samples: &[i16] = unsafe {
-      slice::from_raw_parts(
-        buf.as_ptr() as *const i16,
-        frame_size * channels as usize,
-      )
-    };
-    // wrap PCM into ArcFrame
+  while bytes_read_total < audio_data_size {
+    let bytes_remaining = audio_data_size - bytes_read_total;
+    let bytes_to_read = bytes_per_frame.min(bytes_remaining as usize);
 
-    let frame_kind = match codec_params.clone().kind.unwrap() {
-      av_data::params::MediaKind::Audio(a) => {
-        av_data::frame::MediaKind::Audio(AudioInfo {
-          samples: frame_size,
-          sample_rate: a.rate,
-          map: a.map.unwrap(),
-          format: a.format.unwrap(),
-          // block_len: Some(frame_size * channels),
-          block_len: Some(frame_size),
-        })
-      }
-      av_data::params::MediaKind::Video(_) => {
-        unimplemented!()
-      }
-    };
-
-    let mut frame = av_data::frame::Frame::new_default_frame(frame_kind, None);
-
-    use av_data::frame::FrameBufferConv;
-
-    FrameBufferConv::<i16>::as_mut_slice(frame.buf.as_mut(), 0)
-      .unwrap()
-      .copy_from_slice(samples);
-
-    frame.t.pts = Some(abs_pts_samples);
-    frame.t.dts = Some(abs_pts_samples);
-    frame.t.duration = Some(frame_size as u64);
-    frame.t.timebase = Some(sample_timebase);
-
-    let arc_frame = Arc::new(frame);
-
-    enc.send_frame(&arc_frame).unwrap();
-
-    while let Ok(pkt) = enc.receive_packet() {
-      // Convert packet PTS from samples to milliseconds
-      // let pts_samples = pkt.t.pts.unwrap_or(abs_pts_samples);
-      // let pts_ms = (pts_samples * 1000) / sample_rate as i64;
-
-      // // Initialize cluster on first packet
-      // if !cluster_started {
-      //   cluster_time_ms = pts_ms;
-      //   cluster_started = true;
-      // }
-
-      // // Calculate relative timestamp for this cluster
-      // let mut rel_ts_ms = pts_ms - cluster_time_ms;
-
-      // // Start new cluster if relative timestamp exceeds i16 range
-      // // MKV uses signed 16-bit relative timestamps
-      // if rel_ts_ms > i16::MAX as i64 || rel_ts_ms < i16::MIN as i64 {
-      //   cluster_time_ms = pts_ms;
-      //   rel_ts_ms = 0;
-      // }
-
-      // // Create packet for muxer with millisecond timebase
-      // let mut mux_pkt = pkt.clone();
-      // mux_pkt.stream_index = 0;
-
-      let pts_samples = pkt.t.pts.unwrap_or(0);
-      let pts_ms = (pts_samples * 1000) / sample_rate;
-
-      // Initialize cluster on first packet
-      if !*cluster_started {
-        *cluster_time_ms = pts_ms;
-        *cluster_started = true;
-      }
-
-      // Calculate relative timestamp for this cluster
-      let mut rel_ts_ms = pts_ms - *cluster_time_ms;
-
-      // Start new cluster if relative timestamp exceeds i16 range
-      // MKV uses signed 16-bit relative timestamps
-      if rel_ts_ms > i16::MAX as i64 || rel_ts_ms < i16::MIN as i64 {
-        *cluster_time_ms = pts_ms;
-        rel_ts_ms = 0;
-      }
-
-      // Create packet for muxer with consistent timebase
-      let mut mux_pkt = pkt.clone();
-      mux_pkt.stream_index = 0;
-
-      // Set timestamps in milliseconds with proper timebase
-      mux_pkt.t.pts = Some(pts_ms);
-      mux_pkt.t.dts = Some(pts_ms);
-      mux_pkt.t.timebase = Some(mkv_timebase);
-
-      // Calculate duration in milliseconds
-      if let Some(duration_samples) = pkt.t.duration {
-        let duration_ms = ((duration_samples * 1000)
-          + (sample_rate as u64 / 2))
-          / sample_rate as u64;
-        let duration_ms = duration_ms.max(1);
-        mux_pkt.t.duration = Some(duration_ms);
-      }
-
-      println!("Writing packet: PTS={}ms, rel_ts={}ms", pts_ms, rel_ts_ms);
-
-      // Set absolute PTS/DTS in milliseconds for the muxer
-      // mux_pkt.t.pts = Some(pts_ms);
-      // mux_pkt.t.dts = Some(pts_ms);
-      // mux_pkt.t.timebase = Some(mkv_timebase);
-
-      // Duration in milliseconds
-      // let duration_samples = pkt.t.duration.unwrap_or(frame_size as u64);
-      // let duration_ms = (duration_samples * 1000) / sample_rate as u64;
-      // mux_pkt.t.duration = Some(duration_ms);
-      // let duration_samples = pkt.t.duration.unwrap_or(frame_size as u64);
-      // let duration_ms = ((duration_samples * 1000) + (sample_rate as u64 / 2))
-      //   / sample_rate as u64;
-      // let duration_ms = duration_ms.max(1);
-      // mux_pkt.t.duration = Some(duration_ms);
-
-      // println!(
-      //   "Writing packet: PTS={}ms, rel_ts={}ms, duration={}ms",
-      //   pts_ms, rel_ts_ms
-      // );
-
-      // let pts = pkt.t.pts.unwrap();
-      // let mut rel_ts = (pts - cluster_time) as i32;
-
-      // // if rel_ts would overflow i16, start a new cluster
-      // if rel_ts > i16::MAX as i32 || rel_ts < i16::MIN as i32 {
-      //   cluster_time = pts;
-      //   rel_ts = 0;
-      // }
-
-      // // clamp to i16
-      // let rel_ts_i16 = rel_ts.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
-
-      // // update packet timestamps (optional, for muxer)
-      // let mut pkt = pkt.clone();
-      // pkt.stream_index = 0; // if mono audio, first track
-
-      // pkt.t.pts = Some(cluster_time + rel_ts_i16 as i64);
-      // pkt.t.dts = Some(cluster_time + rel_ts_i16 as i64);
-      println!("{:?}", mux_pkt);
-
-      mux.write_packet(Arc::new(mux_pkt)).unwrap();
+    // Resize buffer if this is the last partial frame
+    if bytes_to_read < bytes_per_frame {
+      buf.resize(bytes_to_read, 0);
     }
 
-    abs_pts_samples += frame_size as i64;
+    while let Ok(_) = in_f.read_exact(&mut buf) {
+      bytes_read_total += bytes_to_read as u32;
+
+      // Convert bytes to samples
+      let samples_in_this_frame =
+        bytes_to_read / (channels * bytes_per_sample as usize);
+      let samples: &[i16] = unsafe {
+        slice::from_raw_parts(
+          buf.as_ptr() as *const i16,
+          samples_in_this_frame * channels,
+        )
+      };
+
+      // If this is a partial frame, pad with zeros
+      let mut padded_samples = vec![0i16; frame_size * channels];
+      let copy_len = samples.len().min(padded_samples.len());
+      padded_samples[..copy_len].copy_from_slice(&samples[..copy_len]);
+
+      // Create frame
+      let frame_kind = match codec_params.clone().kind.unwrap() {
+        av_data::params::MediaKind::Audio(a) => {
+          av_data::frame::MediaKind::Audio(AudioInfo {
+            samples: frame_size,
+            sample_rate: a.rate,
+            map: a.map.unwrap(),
+            format: a.format.unwrap(),
+            block_len: Some(frame_size),
+          })
+        }
+        av_data::params::MediaKind::Video(_) => {
+          unimplemented!()
+        }
+      };
+
+      let mut frame =
+        av_data::frame::Frame::new_default_frame(frame_kind, None);
+
+      use av_data::frame::FrameBufferConv;
+
+      FrameBufferConv::<i16>::as_mut_slice(frame.buf.as_mut(), 0)
+        .unwrap()
+        .copy_from_slice(&padded_samples);
+
+      frame.t.pts = Some(abs_pts_samples);
+      frame.t.dts = Some(abs_pts_samples);
+      frame.t.duration = Some(frame_size as u64);
+      frame.t.timebase = Some(sample_timebase);
+
+      let arc_frame = Arc::new(frame);
+
+      enc.send_frame(&arc_frame).unwrap();
+
+      while let Ok(pkt) = enc.receive_packet() {
+        // Convert packet PTS from samples to milliseconds
+        let pts_samples = pkt.t.pts.unwrap_or(abs_pts_samples);
+        let pts_ms = (pts_samples * 1000) / sample_rate;
+
+        // Initialize cluster on first packet
+        if !cluster_started {
+          cluster_time_ms = pts_ms;
+          cluster_started = true;
+        }
+
+        // Calculate relative timestamp for this cluster
+        let mut rel_ts_ms = pts_ms - cluster_time_ms;
+
+        // Start new cluster if relative timestamp exceeds i16 range
+        if rel_ts_ms > i16::MAX as i64 || rel_ts_ms < i16::MIN as i64 {
+          cluster_time_ms = pts_ms;
+          rel_ts_ms = 0;
+        }
+
+        // Create packet for muxer
+        let mut mux_pkt = pkt.clone();
+        mux_pkt.stream_index = 0;
+        mux_pkt.t.pts = Some(pts_ms);
+        mux_pkt.t.dts = Some(pts_ms);
+        mux_pkt.t.timebase = Some(mkv_timebase);
+
+        if let Some(duration_samples) = pkt.t.duration {
+          let duration_ms = ((duration_samples * 1000)
+            + (sample_rate as u64 / 2))
+            / sample_rate as u64;
+          let duration_ms = duration_ms.max(1);
+          mux_pkt.t.duration = Some(duration_ms);
+        }
+
+        println!(
+          "Writing packet: PTS={}ms, samples processed: {}/{}",
+          pts_ms,
+          bytes_read_total / bytes_per_sample / wav_channels as u32,
+          total_samples
+        );
+
+        mux.write_packet(Arc::new(mux_pkt)).unwrap();
+      }
+
+      abs_pts_samples += frame_size as i64;
+
+      // Break if we've processed all the audio data
+      if bytes_read_total >= audio_data_size {
+        break;
+      }
+    }
   }
 
-  enc.flush().unwrap();
-  while let Ok(pkt) = enc.receive_packet() {
-    let pts_samples = pkt.t.pts.unwrap_or(abs_pts_samples);
-    let pts_ms = (pts_samples * 1000) / sample_rate as i64;
+  // while let Ok(_) = in_f.read_exact(&mut buf) {
+  //   // let samples: &[i16] =
+  //   //   unsafe { slice::from_raw_parts(buf.as_ptr() as *const i16, frame_size) };
 
-    let mut mux_pkt = pkt.clone();
-    mux_pkt.stream_index = 0;
-    mux_pkt.t.pts = Some(pts_ms);
-    mux_pkt.t.dts = Some(pts_ms);
-    mux_pkt.t.timebase = Some(mkv_timebase);
+  //   let samples: &[i16] = unsafe {
+  //     slice::from_raw_parts(
+  //       buf.as_ptr() as *const i16,
+  //       frame_size * channels as usize,
+  //     )
+  //   };
+  //   // wrap PCM into ArcFrame
 
-    let duration_samples = pkt.t.duration.unwrap_or(frame_size as u64);
-    let duration_ms = ((duration_samples * 1000) + (sample_rate as u64 / 2))
-      / sample_rate as u64;
-    let duration_ms = duration_ms.max(1);
-    mux_pkt.t.duration = Some(duration_ms);
+  //   let frame_kind = match codec_params.clone().kind.unwrap() {
+  //     av_data::params::MediaKind::Audio(a) => {
+  //       av_data::frame::MediaKind::Audio(AudioInfo {
+  //         samples: frame_size,
+  //         sample_rate: a.rate,
+  //         map: a.map.unwrap(),
+  //         format: a.format.unwrap(),
+  //         // block_len: Some(frame_size * channels),
+  //         block_len: Some(frame_size),
+  //       })
+  //     }
+  //     av_data::params::MediaKind::Video(_) => {
+  //       unimplemented!()
+  //     }
+  //   };
 
-    println!(
-      "Flushing packet: PTS={}ms, duration={}ms (samples={})",
-      pts_ms, duration_ms, duration_samples
-    );
-    mux.write_packet(Arc::new(mux_pkt)).unwrap();
-  }
+  //   let mut frame = av_data::frame::Frame::new_default_frame(frame_kind, None);
+
+  //   use av_data::frame::FrameBufferConv;
+
+  //   FrameBufferConv::<i16>::as_mut_slice(frame.buf.as_mut(), 0)
+  //     .unwrap()
+  //     .copy_from_slice(samples);
+
+  //   frame.t.pts = Some(abs_pts_samples);
+  //   frame.t.dts = Some(abs_pts_samples);
+  //   frame.t.duration = Some(frame_size as u64);
+  //   frame.t.timebase = Some(sample_timebase);
+
+  //   let arc_frame = Arc::new(frame);
+
+  //   enc.send_frame(&arc_frame).unwrap();
+
+  //   while let Ok(pkt) = enc.receive_packet() {
+  //     write_packet_to_mux(
+  //       &mut mux,
+  //       pkt,
+  //       &mut cluster_time_ms,
+  //       &mut cluster_started,
+  //       sample_rate as i64,
+  //     )
+  //     .unwrap();
+  //   }
+
+  //   abs_pts_samples += frame_size as i64;
+  // }
+
+  // enc.flush().unwrap();
+  // while let Ok(pkt) = enc.receive_packet() {
+  //   write_packet_to_mux(
+  //     &mut mux,
+  //     pkt,
+  //     &mut cluster_time_ms,
+  //     &mut cluster_started,
+  //     sample_rate as i64,
+  //   )
+  //   .unwrap();
+  // }
 
   mux.write_trailer().unwrap();
 

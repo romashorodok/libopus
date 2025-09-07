@@ -515,12 +515,10 @@ pub mod encoder_trait {
 
               // Always advance by frame_size (960 samples) for Opus
               pts += self.frame_size as i64;
-
               // pkt.t.pts = Some(pts);
               // pkt.t.dts = Some(pts);
               // pkt.t.duration = Some(duration as u64);
               // pts += duration;
-
               pkt.data.truncate(len);
               pending.push_back(pkt);
             }
