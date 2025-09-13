@@ -309,7 +309,6 @@ pub mod encoder_trait {
   use av_data::frame::{ArcFrame, FrameBufferConv, MediaKind};
   use av_data::packet::Packet;
   use av_data::params::CodecParams;
-  use av_data::rational::Rational64;
   use av_data::value::Value;
   use std::collections::VecDeque;
 
@@ -614,4 +613,169 @@ pub mod encoder_trait {
   };
 }
 
-pub use self::encoder_trait::OPUS_DESCR;
+// pub use self::encoder_trait::OPUS_DESCR;
+
+pub mod decoder_trait {
+  use crate::OPUS_SET_GAIN_REQUEST;
+
+  use super::Decoder as OpusDecoder;
+  use av_bitstream::byteread::get_i16l;
+  use av_codec::decoder::*;
+  use av_codec::error::*;
+  use av_data::audiosample::ChannelMap;
+  use av_data::audiosample::formats::S16;
+  use av_data::frame::*;
+  use av_data::packet::Packet;
+  use std::collections::VecDeque;
+  use std::sync::Arc;
+
+  pub struct Des {
+    descr: Descr,
+  }
+
+  pub struct Dec {
+    dec: Option<OpusDecoder>,
+    extradata: Option<Vec<u8>>,
+    pending: VecDeque<ArcFrame>,
+    info: AudioInfo,
+  }
+
+  impl Dec {
+    fn new() -> Self {
+      Dec {
+        dec: None,
+        extradata: None,
+        pending: VecDeque::with_capacity(1),
+        info: AudioInfo {
+          samples: 960 * 6,
+          sample_rate: 48000,
+          map: ChannelMap::new(),
+          format: Arc::new(S16),
+          block_len: None,
+        },
+      }
+    }
+  }
+
+  impl Descriptor for Des {
+    type OutputDecoder = Dec;
+
+    fn create(&self) -> Self::OutputDecoder {
+      Dec::new()
+    }
+
+    fn describe(&self) -> &Descr {
+      &self.descr
+    }
+  }
+
+  const OPUS_HEAD_SIZE: usize = 19;
+
+  impl Decoder for Dec {
+    fn set_extradata(&mut self, extra: &[u8]) {
+      self.extradata = Some(Vec::from(extra));
+    }
+    fn send_packet(&mut self, pkt: &Packet) -> Result<()> {
+      let mut f =
+        Frame::new_default_frame(self.info.clone(), Some(pkt.t.clone()));
+
+      let ret = {
+        let buf: &mut [i16] = f.buf.as_mut_slice(0).unwrap();
+
+        self
+          .dec
+          .as_mut()
+          .unwrap()
+          .decode(pkt.data.as_slice(), buf, false)
+          .map_err(|_e| Error::InvalidData)
+      };
+
+      match ret {
+        Ok(samples) => {
+          if let MediaKind::Audio(ref mut info) = f.kind {
+            info.samples = samples;
+          }
+          self.pending.push_back(Arc::new(f));
+          Ok(())
+        }
+        Err(e) => Err(e),
+      }
+    }
+    fn receive_frame(&mut self) -> Result<ArcFrame> {
+      self.pending.pop_front().ok_or(Error::MoreDataNeeded)
+    }
+    fn configure(&mut self) -> Result<()> {
+      let channels;
+      let sample_rate = 48000;
+      let mut gain_db = 0;
+      let mut streams = 1;
+      let mut coupled_streams = 0;
+      let mut mapping: &[u8] = &[0u8, 1u8];
+      let mut channel_map = false;
+
+      if let Some(ref extradata) = self.extradata {
+        // channels = *extradata.get(9).unwrap_or(&2) as usize;
+        channels = *extradata.get(9).unwrap_or(&1) as usize;
+
+        if extradata.len() >= OPUS_HEAD_SIZE {
+          gain_db = get_i16l(&extradata[16..18]);
+          channel_map = extradata[18] != 0;
+        }
+        if extradata.len() >= OPUS_HEAD_SIZE + 2 + channels {
+          streams = extradata[OPUS_HEAD_SIZE] as usize;
+          coupled_streams = extradata[OPUS_HEAD_SIZE + 1] as usize;
+          if streams + coupled_streams != channels {
+            unimplemented!()
+          }
+          mapping = &extradata[OPUS_HEAD_SIZE + 2..]
+        } else {
+          if channels > 2 || channel_map {
+            return Err(Error::ConfigurationInvalid);
+          }
+          if channels > 1 {
+            coupled_streams = 1;
+          }
+        }
+      } else {
+        return Err(Error::ConfigurationIncomplete);
+      }
+
+      if channels > 2 {
+        unimplemented!() // TODO: Support properly channel mapping
+      } else {
+        self.info.map = ChannelMap::default_map(channels);
+      }
+
+      match OpusDecoder::create(
+        sample_rate,
+        channels,
+        streams,
+        coupled_streams,
+        mapping,
+      ) {
+        Ok(mut d) => {
+          let _ = d.set_option(OPUS_SET_GAIN_REQUEST, gain_db as i32);
+          self.dec = Some(d);
+          Ok(())
+        }
+        Err(_) => Err(Error::ConfigurationInvalid),
+      }
+    }
+
+    fn flush(&mut self) -> Result<()> {
+      self.dec.as_mut().unwrap().reset();
+      Ok(())
+    }
+  }
+
+  pub const OPUS_DESCR: &Des = &Des {
+    descr: Descr {
+      codec: "opus",
+      name: "libopus",
+      desc: "libopus decoder",
+      mime: "audio/OPUS",
+    },
+  };
+}
+
+// pub use self::decoder_trait::OPUS_DESCR;

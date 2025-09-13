@@ -222,7 +222,7 @@ fn main() {
 
   let channels: usize = wav_channels as usize;
 
-  let mut enc = OPUS_DESCR.create();
+  let mut enc = encoder_trait::OPUS_DESCR.create();
   enc
     .set_option("channels", av_data::value::Value::U64(channels as u64))
     .unwrap();
